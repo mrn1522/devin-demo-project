@@ -95,35 +95,54 @@ jobs:
           set -euo pipefail
           BRANCHES=$(gh api "repos/$GITHUB_REPOSITORY/branches?per_page=100" --paginate \
             --jq '.[].name | select(startswith("devin/"))')
-          for BRANCH in $BRANCHES; do
-            INFO=$(gh api graphql --jq '[(.data.repository.open.nodes | length), (.data.repository.basedOn.nodes | length), (.data.repository.merged.nodes[0].headRefOid // "")] | @tsv' \
-              -f o="$OWNER" -f n="$REPO" -f b="$BRANCH" -f query='
-                query($o: String!, $n: String!, $b: String!) {
-                  repository(owner: $o, name: $n) {
-                    merged: pullRequests(headRefName: $b, states: [MERGED], first: 1) { nodes { headRefOid } }
-                    open: pullRequests(headRefName: $b, states: [OPEN], first: 1) { nodes { id } }
-                    basedOn: pullRequests(baseRefName: $b, states: [OPEN], first: 1) { nodes { id } }
-                  }
-                }')
-            read -r OPEN_COUNT DEPENDENT_COUNT MERGED_SHA <<< "$INFO"
+          if [ -z "$BRANCHES" ]; then
+            echo "No devin/* branches."
+            exit 0
+          fi
 
-            # No merged PR for this branch, or a live PR depends on it.
-            if [ -z "$MERGED_SHA" ] || [ "$OPEN_COUNT" -gt 0 ] || [ "$DEPENDENT_COUNT" -gt 0 ]; then
-              continue
-            fi
+          PR_STATE_QUERY='query($o: String!, $n: String!, $b: String!) {
+            repository(owner: $o, name: $n) {
+              merged: pullRequests(headRefName: $b, states: [MERGED], first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { headRefOid } }
+              open: pullRequests(headRefName: $b, states: [OPEN], first: 1) { nodes { id } }
+              basedOn: pullRequests(baseRefName: $b, states: [OPEN], first: 1) { nodes { id } }
+            }
+          }'
 
-            # Branch moved past the merge — it carries new work, keep it.
+          while IFS= read -r BRANCH; do
             CURRENT_SHA=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
-            if [ "$CURRENT_SHA" != "$MERGED_SHA" ]; then
+            if [ -z "$CURRENT_SHA" ]; then
               continue
             fi
 
-            if PUSH_OUT=$(git push origin --delete --force-with-lease="refs/heads/$BRANCH:$MERGED_SHA" "refs/heads/$BRANCH" 2>&1); then
-              echo "Deleted $BRANCH (merged at $MERGED_SHA)."
+            INFO=$(gh api graphql \
+              --jq '[(.data.repository.open.nodes | length), (.data.repository.basedOn.nodes | length), (.data.repository.merged.nodes | map(.headRefOid) | join(","))] | @tsv' \
+              -f o="$OWNER" -f n="$REPO" -f b="$BRANCH" -f query="$PR_STATE_QUERY")
+            read -r OPEN_COUNT DEPENDENT_COUNT MERGED_SHAS <<< "$INFO"
+
+            # Keep branches with open PRs on them, open PRs based on them,
+            # or no merged PR whose head SHA matches the current tip.
+            if [ "$OPEN_COUNT" -gt 0 ] || [ "$DEPENDENT_COUNT" -gt 0 ] || \
+               ! echo "$MERGED_SHAS" | tr ',' '\n' | grep -qx "$CURRENT_SHA"; then
+              continue
+            fi
+
+            # Recheck PR dependencies immediately before deleting — a PR opened
+            # since INFO does not move the ref, so the lease alone can't see it.
+            RECHECK=$(gh api graphql \
+              --jq '[(.data.repository.open.nodes | length), (.data.repository.basedOn.nodes | length)] | @tsv' \
+              -f o="$OWNER" -f n="$REPO" -f b="$BRANCH" -f query="$PR_STATE_QUERY")
+            read -r OPEN_COUNT DEPENDENT_COUNT <<< "$RECHECK"
+            if [ "$OPEN_COUNT" -gt 0 ] || [ "$DEPENDENT_COUNT" -gt 0 ]; then
+              echo "Branch $BRANCH gained an open PR; leaving it."
+              continue
+            fi
+
+            if PUSH_OUT=$(git push origin --delete --force-with-lease="refs/heads/$BRANCH:$CURRENT_SHA" "refs/heads/$BRANCH" 2>&1); then
+              echo "Deleted $BRANCH (merged at $CURRENT_SHA)."
             elif echo "$PUSH_OUT" | grep -qE "stale info|does not exist"; then
               echo "Branch $BRANCH changed concurrently; leaving it."
             else
               echo "$PUSH_OUT" >&2
               exit 1
             fi
-          done
+          done <<< "$BRANCHES"
