@@ -2,7 +2,7 @@ name: Auto-merge Devin PRs
 
 on:
   pull_request:
-    types: [opened, ready_for_review, reopened, synchronize]
+    types: [opened, ready_for_review, reopened, synchronize, closed]
 
 permissions:
   contents: write
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   auto-merge:
-    if: github.event.pull_request.user.login == 'devin-ai-integration[bot]'
+    if: github.event.pull_request.user.login == 'devin-ai-integration[bot]' && github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - name: Enable auto-merge
@@ -20,4 +20,16 @@ jobs:
         # Arm auto-merge only — GitHub merges once every required check and
         # required review is satisfied. No direct-merge fallback: a privileged
         # merge here could bypass checks that are still pending.
-        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch
+        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash
+
+  cleanup-branch:
+    # GitHub's "Automatically delete head branches" does not reliably fire for
+    # merges performed by the auto-merge executor, so delete explicitly.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete merged head branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$HEAD_REF" || true
