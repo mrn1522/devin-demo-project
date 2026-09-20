@@ -173,11 +173,13 @@ jobs:
             fi
 
             # Snapshot before the delete so PRs created inside the check-delete
-            # race stay detectable afterward. Any PR created between the
-            # snapshot and the delete is already closed or retargeted by the
-            # time we look again, so it must be diffed, not queried by state.
+            # race stay detectable afterward, and record the time so
+            # window-created dependents can be found by creation date (a PR
+            # retargeted off a deleted base no longer matches base=$BRANCH).
+            SNAP_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
             snapshot_prs
-            PREV_SET=$(printf '%s\n' $HEAD_PRS $BASE_PRS | sort -u)
+            PREV_HEAD_SET=$HEAD_PRS
+            PREV_BASE_SET=$BASE_PRS
 
             # Recheck immediately before deleting — a PR opened since the first
             # query does not move the ref, so the lease alone can't see it.
@@ -197,16 +199,51 @@ jobs:
             fi
             echo "Deleted $BRANCH (merged at $CURRENT_SHA)."
 
-            # Repair race casualties: restore the ref via the API (the shallow
-            # checkout lacks CURRENT_SHA as a local object, so `git push SHA:`
-            # cannot work; POST /git/refs also fails atomically if the ref
-            # already exists), then reopen head-closed PRs and retarget
-            # base-deleted PRs back onto the restored branch.
+            # Repair race casualties, detected separately by role:
+            #  - head casualties: new entries in the head set (a PR closed by
+            #    the delete still matches head=$OWNER:$BRANCH) → reopen.
+            #  - base casualties: (a) pre-snapshot dependents whose base moved,
+            #    (b) dependents created in the window — GitHub retargeted them,
+            #    so find them via automatic_base_change_* timeline events.
             sleep 2
             snapshot_prs
-            NEW_SET=$(printf '%s\n' $HEAD_PRS $BASE_PRS | sort -u)
-            CASUALTIES=$(comm -13 <(printf '%s\n' "$PREV_SET") <(printf '%s\n' "$NEW_SET"))
-            if [ -n "$CASUALTIES" ]; then
+            HEAD_CASUALTIES=$(comm -13 <(printf '%s\n' "$PREV_HEAD_SET") <(printf '%s\n' "$HEAD_PRS"))
+            BASE_CASUALTIES=""
+            for PR_NUM in $PREV_BASE_SET; do
+              PR_INFO=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" \
+                --jq '[.state, .base.ref] | @tsv')
+              read -r PR_STATE PR_BASE <<< "$PR_INFO"
+              if [ "$PR_STATE" = "open" ] && [ "$PR_BASE" != "$BRANCH" ]; then
+                BASE_CASUALTIES=$(printf '%s\n%s\n' "$BASE_CASUALTIES" "$PR_NUM")
+              fi
+            done
+            RECENT=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" --paginate \
+              -f state=open -f sort=created -f direction=desc -f per_page=30 \
+              --jq '.[] | [.number, .created_at] | @tsv')
+            while IFS=$'\t' read -r PR_NUM PR_CREATED; do
+              if [[ -z "$PR_NUM" || ! "$PR_CREATED" > "$SNAP_TS" ]]; then
+                break
+              fi
+              EV=$(gh api graphql \
+                --jq '.data.repository.pullRequest.timelineItems.nodes | length' \
+                -f o="$OWNER" -f n="$REPO" -F num="$PR_NUM" -f query='
+                  query($o: String!, $n: String!, $num: Int!) {
+                    repository(owner: $o, name: $n) {
+                      pullRequest(number: $num) {
+                        timelineItems(itemTypes: [BASE_REF_CHANGED_EVENT, AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT], last: 10) { nodes { __typename } }
+                      }
+                    }
+                  }')
+              if [ "$EV" != "0" ]; then
+                BASE_CASUALTIES=$(printf '%s\n%s\n' "$BASE_CASUALTIES" "$PR_NUM")
+              fi
+            done <<< "$RECENT"
+            BASE_CASUALTIES=$(printf '%s\n' $BASE_CASUALTIES | sort -u | grep -v '^$' || true)
+
+            if [ -n "$HEAD_CASUALTIES$BASE_CASUALTIES" ]; then
+              # Restore the ref via the API — the shallow checkout lacks
+              # CURRENT_SHA as a local object (git push SHA: can't work) and
+              # POST /git/refs fails atomically if the ref already exists.
               if ! RESTORE_OUT=$(gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
                   -f "ref=refs/heads/$BRANCH" -f "sha=$CURRENT_SHA" 2>&1); then
                 if echo "$RESTORE_OUT" | grep -q "already exists"; then
@@ -218,23 +255,15 @@ jobs:
               else
                 echo "Restored $BRANCH at $CURRENT_SHA — a new PR referenced it."
               fi
-              while IFS= read -r PR_NUM; do
-                if [ -z "$PR_NUM" ]; then
-                  continue
-                fi
-                PR_INFO=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" \
-                  --jq '[.state, .base.ref] | @tsv')
-                read -r PR_STATE PR_BASE <<< "$PR_INFO"
-                if [ "$PR_STATE" = "closed" ]; then
-                  gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" \
-                    -f state=open > /dev/null
-                  echo "Reopened PR #$PR_NUM (head branch restored)."
-                fi
-                if [ "$PR_BASE" != "$BRANCH" ]; then
-                  gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" \
-                    -f "base=$BRANCH" > /dev/null
-                  echo "Retargeted PR #$PR_NUM back onto $BRANCH."
-                fi
-              done <<< "$CASUALTIES"
+              for PR_NUM in $HEAD_CASUALTIES; do
+                gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" \
+                  -f state=open > /dev/null
+                echo "Reopened PR #$PR_NUM (head branch restored)."
+              done
+              for PR_NUM in $BASE_CASUALTIES; do
+                gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" \
+                  -f "base=$BRANCH" > /dev/null
+                echo "Retargeted PR #$PR_NUM back onto $BRANCH."
+              done
             fi
           done <<< "$BRANCHES"
