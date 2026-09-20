@@ -1,0 +1,12 @@
+export const CANVAS_WIDTH = 288;
+export const CANVAS_HEIGHT = 512;
+export const BIRD_X = 60;
+export const BIRD_SIZE = 24;
+export const GRAVITY = 1200;
+export const FLAP_VELOCITY = -350;
+export const PIPE_SPEED = 150;
+export const PIPE_WIDTH = 52;
+export const PIPE_GAP = 130;
+export const PIPE_SPAWN_INTERVAL = 1.5;
+export const GROUND_HEIGHT = 80;
+export const PIPE_MIN_TOP = 40;
