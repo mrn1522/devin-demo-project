@@ -93,6 +93,9 @@ jobs:
           REPO: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
+          # Grace period: a freshly merged branch may still get a new PR opened
+          # against it; only sweep merges older than this.
+          CUTOFF=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
           BRANCHES=$(gh api "repos/$GITHUB_REPOSITORY/branches?per_page=100" --paginate \
             --jq '.[].name | select(startswith("devin/"))')
           if [ -z "$BRANCHES" ]; then
@@ -100,13 +103,28 @@ jobs:
             exit 0
           fi
 
-          PR_STATE_QUERY='query($o: String!, $n: String!, $b: String!) {
+          # headRefName also matches fork PRs with a coincidental branch name, so
+          # every PR row carries headRepository.nameWithOwner and is counted only
+          # when it belongs to this repository. Rows are positional:
+          #   line 1            = open PRs based on the branch (any head repo)
+          #   plain-name rows   = head repos of open PRs using the branch as head
+          #   tab-separated     = merged PRs associated with CURRENT_SHA
+          #                       (head sha, mergedAt, head repo)
+          PR_STATE_QUERY='query($o: String!, $n: String!, $b: String!, $s: GitObjectID!) {
             repository(owner: $o, name: $n) {
-              merged: pullRequests(headRefName: $b, states: [MERGED], first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { headRefOid } }
-              open: pullRequests(headRefName: $b, states: [OPEN], first: 1) { nodes { id } }
-              basedOn: pullRequests(baseRefName: $b, states: [OPEN], first: 1) { nodes { id } }
+              basedOn: pullRequests(baseRefName: $b, states: [OPEN], first: 10) { nodes { id } }
+              open: pullRequests(headRefName: $b, states: [OPEN], first: 10) { nodes { headRepository { nameWithOwner } } }
+              commit: object(oid: $s) { ... on Commit { associatedPullRequests(first: 50) { nodes { state headRefOid mergedAt headRepository { nameWithOwner } } } } }
             }
           }'
+
+          get_state() {
+            gh api graphql \
+              --jq '(.data.repository.basedOn.nodes | length),
+                    (.data.repository.open.nodes[]? | .headRepository.nameWithOwner),
+                    ((.data.repository.commit.associatedPullRequests.nodes // [])[] | select(.state == "MERGED") | [.headRefOid, .mergedAt, .headRepository.nameWithOwner] | @tsv)' \
+              -f o="$OWNER" -f n="$REPO" -f b="$BRANCH" -F s="$CURRENT_SHA" -f query="$PR_STATE_QUERY"
+          }
 
           while IFS= read -r BRANCH; do
             CURRENT_SHA=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
@@ -114,35 +132,82 @@ jobs:
               continue
             fi
 
-            INFO=$(gh api graphql \
-              --jq '[(.data.repository.open.nodes | length), (.data.repository.basedOn.nodes | length), (.data.repository.merged.nodes | map(.headRefOid) | join(","))] | @tsv' \
-              -f o="$OWNER" -f n="$REPO" -f b="$BRANCH" -f query="$PR_STATE_QUERY")
-            read -r OPEN_COUNT DEPENDENT_COUNT MERGED_SHAS <<< "$INFO"
+            mapfile -t ROWS < <(get_state)
+            # Process substitution swallows gh's exit code — validate the row
+            # is the numeric count the query promises before trusting it.
+            if ! [[ "${ROWS[0]:-}" =~ ^[0-9]+$ ]]; then
+              echo "PR state query failed for $BRANCH: ${ROWS[*]:-<empty>}" >&2
+              exit 1
+            fi
+            DEPENDENT_COUNT="${ROWS[0]}"
+            OPEN_COUNT=0
+            MATCHED=0
+            for ROW in "${ROWS[@]:1}"; do
+              if [[ "$ROW" != *$'\t'* ]]; then
+                [ "$ROW" = "$GITHUB_REPOSITORY" ] && OPEN_COUNT=$((OPEN_COUNT + 1))
+                continue
+              fi
+              PR_SHA="${ROW%%$'\t'*}"
+              REST="${ROW#*$'\t'}"
+              PR_AT="${REST%%$'\t'*}"
+              PR_REPO="${REST##*$'\t'}"
+              if [ "$PR_REPO" = "$GITHUB_REPOSITORY" ] && [ "$PR_SHA" = "$CURRENT_SHA" ] && [[ "$PR_AT" < "$CUTOFF" ]]; then
+                MATCHED=1
+              fi
+            done
 
-            # Keep branches with open PRs on them, open PRs based on them,
-            # or no merged PR whose head SHA matches the current tip.
-            if [ "$OPEN_COUNT" -gt 0 ] || [ "$DEPENDENT_COUNT" -gt 0 ] || \
-               ! echo "$MERGED_SHAS" | tr ',' '\n' | grep -qx "$CURRENT_SHA"; then
+            # Keep branches with live PRs on or under them, or whose tip was
+            # never the head of a merged PR older than the grace window.
+            if [ "$OPEN_COUNT" -gt 0 ] || [ "$DEPENDENT_COUNT" -gt 0 ] || [ "$MATCHED" -eq 0 ]; then
               continue
             fi
 
-            # Recheck PR dependencies immediately before deleting — a PR opened
-            # since INFO does not move the ref, so the lease alone can't see it.
-            RECHECK=$(gh api graphql \
-              --jq '[(.data.repository.open.nodes | length), (.data.repository.basedOn.nodes | length)] | @tsv' \
-              -f o="$OWNER" -f n="$REPO" -f b="$BRANCH" -f query="$PR_STATE_QUERY")
-            read -r OPEN_COUNT DEPENDENT_COUNT <<< "$RECHECK"
+            # Recheck immediately before deleting — a PR opened since the first
+            # query does not move the ref, so the lease alone can't see it.
+            mapfile -t ROWS < <(get_state)
+            if ! [[ "${ROWS[0]:-}" =~ ^[0-9]+$ ]]; then
+              echo "PR state query failed for $BRANCH: ${ROWS[*]:-<empty>}" >&2
+              exit 1
+            fi
+            DEPENDENT_COUNT="${ROWS[0]}"
+            OPEN_COUNT=0
+            for ROW in "${ROWS[@]:1}"; do
+              if [[ "$ROW" != *$'\t'* ]] && [ "$ROW" = "$GITHUB_REPOSITORY" ]; then
+                OPEN_COUNT=$((OPEN_COUNT + 1))
+              fi
+            done
             if [ "$OPEN_COUNT" -gt 0 ] || [ "$DEPENDENT_COUNT" -gt 0 ]; then
               echo "Branch $BRANCH gained an open PR; leaving it."
               continue
             fi
 
-            if PUSH_OUT=$(git push origin --delete --force-with-lease="refs/heads/$BRANCH:$CURRENT_SHA" "refs/heads/$BRANCH" 2>&1); then
-              echo "Deleted $BRANCH (merged at $CURRENT_SHA)."
-            elif echo "$PUSH_OUT" | grep -qE "stale info|does not exist"; then
-              echo "Branch $BRANCH changed concurrently; leaving it."
-            else
+            if ! PUSH_OUT=$(git push origin --delete --force-with-lease="refs/heads/$BRANCH:$CURRENT_SHA" "refs/heads/$BRANCH" 2>&1); then
+              if echo "$PUSH_OUT" | grep -qE "stale info|does not exist"; then
+                echo "Branch $BRANCH changed concurrently; leaving it."
+                continue
+              fi
               echo "$PUSH_OUT" >&2
               exit 1
+            fi
+            echo "Deleted $BRANCH (merged at $CURRENT_SHA)."
+
+            # Recovery: if a PR materialized inside the check-delete race
+            # window, restore the branch to its merged SHA.
+            sleep 2
+            mapfile -t ROWS < <(get_state)
+            if ! [[ "${ROWS[0]:-}" =~ ^[0-9]+$ ]]; then
+              echo "Post-delete state query failed for $BRANCH" >&2
+              exit 1
+            fi
+            DEPENDENT_COUNT="${ROWS[0]}"
+            OPEN_COUNT=0
+            for ROW in "${ROWS[@]:1}"; do
+              if [[ "$ROW" != *$'\t'* ]] && [ "$ROW" = "$GITHUB_REPOSITORY" ]; then
+                OPEN_COUNT=$((OPEN_COUNT + 1))
+              fi
+            done
+            if [ "$OPEN_COUNT" -gt 0 ] || [ "$DEPENDENT_COUNT" -gt 0 ]; then
+              git push origin "$CURRENT_SHA:refs/heads/$BRANCH"
+              echo "Restored $BRANCH at $CURRENT_SHA — an open PR referenced it."
             fi
           done <<< "$BRANCHES"
