@@ -14,6 +14,7 @@ Otherwise, completely ignore this rule.
 
 ### BEHAVIOR
 
+- Apply this behavior only during Devin sessions.
 - Read inline suggestions and warnings posted by @coderabbitai on the PR diff.
 - Address legitimate runtime bugs, missing null checks, security flaws, and runtime regressions in a new commit. Ignore stylistic nitpicks and subjective refactoring suggestions.
 - Never engage in conversational chat with @coderabbitai. Only use commands:

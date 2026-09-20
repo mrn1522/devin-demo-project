@@ -34,5 +34,5 @@ Treat every PR as a deep audit, not a surface pass. Beyond Bug Catcher defaults,
 
 ## Scope
 
-- Ignore generated output (`dist/`, `*.min.*`) and lockfile churn.
-- Markdown-only changes (`docs/`, `*.md`) need only a light pass.
+- Ignore generated output (`dist/`, `*.min.*`) and lockfile-only formatting or ordering churn. Review dependency version, resolution, and integrity changes under the deep-audit and security rules above.
+- Markdown-only changes (`docs/`, `*.md`) need only a light pass, except `AGENTS.md` and `REVIEW.md`, which require the deep audit above.
