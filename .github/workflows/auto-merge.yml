@@ -3,6 +3,9 @@ name: Auto-merge Devin PRs
 on:
   pull_request:
     types: [opened, ready_for_review, reopened, synchronize, closed]
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -73,3 +76,54 @@ jobs:
             exit 1
           fi
           echo "Deleted merged branch $HEAD_REF."
+
+  sweep-stale-branches:
+    # pull_request.closed never fires for merges executed by the auto-merge
+    # executor: the merge runs as github-actions[bot], and events caused by a
+    # GITHUB_TOKEN-initiated action don't trigger workflows. Sweep on a
+    # schedule to catch the devin/* branches that cleanup-branch misses.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete devin/* branches whose PRs merged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          BRANCHES=$(gh api "repos/$GITHUB_REPOSITORY/branches?per_page=100" --paginate \
+            --jq '.[].name | select(startswith("devin/"))')
+          for BRANCH in $BRANCHES; do
+            INFO=$(gh api graphql --jq '[(.data.repository.open.nodes | length), (.data.repository.basedOn.nodes | length), (.data.repository.merged.nodes[0].headRefOid // "")] | @tsv' \
+              -f o="$OWNER" -f n="$REPO" -f b="$BRANCH" -f query='
+                query($o: String!, $n: String!, $b: String!) {
+                  repository(owner: $o, name: $n) {
+                    merged: pullRequests(headRefName: $b, states: [MERGED], first: 1) { nodes { headRefOid } }
+                    open: pullRequests(headRefName: $b, states: [OPEN], first: 1) { nodes { id } }
+                    basedOn: pullRequests(baseRefName: $b, states: [OPEN], first: 1) { nodes { id } }
+                  }
+                }')
+            read -r OPEN_COUNT DEPENDENT_COUNT MERGED_SHA <<< "$INFO"
+
+            # No merged PR for this branch, or a live PR depends on it.
+            if [ -z "$MERGED_SHA" ] || [ "$OPEN_COUNT" -gt 0 ] || [ "$DEPENDENT_COUNT" -gt 0 ]; then
+              continue
+            fi
+
+            # Branch moved past the merge — it carries new work, keep it.
+            CURRENT_SHA=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
+            if [ "$CURRENT_SHA" != "$MERGED_SHA" ]; then
+              continue
+            fi
+
+            if PUSH_OUT=$(git push origin --delete --force-with-lease="refs/heads/$BRANCH:$MERGED_SHA" "refs/heads/$BRANCH" 2>&1); then
+              echo "Deleted $BRANCH (merged at $MERGED_SHA)."
+            elif echo "$PUSH_OUT" | grep -qE "stale info|does not exist"; then
+              echo "Branch $BRANCH changed concurrently; leaving it."
+            else
+              echo "$PUSH_OUT" >&2
+              exit 1
+            fi
+          done
