@@ -2,7 +2,7 @@ name: Auto-merge Devin PRs
 
 on:
   pull_request:
-    types: [opened, ready_for_review, synchronize]
+    types: [opened, ready_for_review, reopened, synchronize]
 
 permissions:
   contents: write
@@ -17,6 +17,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch \
-            || gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --squash --delete-branch
+        # Arm auto-merge only — GitHub merges once every required check and
+        # required review is satisfied. No direct-merge fallback: a privileged
+        # merge here could bypass checks that are still pending.
+        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch
