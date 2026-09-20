@@ -32,4 +32,39 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$HEAD_REF" || true
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$HEAD_REF" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+            echo "Unexpected branch name format: $HEAD_REF" >&2
+            exit 1
+          fi
+          REF="repos/$GITHUB_REPOSITORY/git/refs/heads/$HEAD_REF"
+
+          # The repo's auto-delete setting may have already removed the branch.
+          if ! REF_JSON=$(gh api "$REF" 2>&1); then
+            if echo "$REF_JSON" | grep -q "404"; then
+              echo "Branch $HEAD_REF already deleted."
+              exit 0
+            fi
+            echo "$REF_JSON" >&2
+            exit 1
+          fi
+
+          # Only delete the exact ref instance that was merged: if the branch
+          # name was recreated with new commits, it is not ours to remove.
+          CURRENT_SHA=$(echo "$REF_JSON" | jq -r .object.sha)
+          if [ "$CURRENT_SHA" != "$HEAD_SHA" ]; then
+            echo "Branch $HEAD_REF was recreated at $CURRENT_SHA (merged $HEAD_SHA); leaving it."
+            exit 0
+          fi
+
+          if ! DELETE_OUT=$(gh api -X DELETE "$REF" 2>&1); then
+            if echo "$DELETE_OUT" | grep -q "404"; then
+              echo "Branch $HEAD_REF deleted concurrently."
+              exit 0
+            fi
+            echo "$DELETE_OUT" >&2
+            exit 1
+          fi
+          echo "Deleted merged branch $HEAD_REF."
