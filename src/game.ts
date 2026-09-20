@@ -53,16 +53,16 @@ export function updateGame(game: Game, dt: number, random: () => number): Game {
     pipes = [...pipes, spawnPipe(random)];
   }
 
+  const birdRectangle = birdBox(bird);
   let score = game.score;
   pipes = pipes.map((pipe) => {
-    if (!pipe.passed && pipe.x + PIPE_WIDTH < bird.x) {
+    if (!pipe.passed && pipe.x + PIPE_WIDTH < birdRectangle.x) {
       score += 1;
       return { ...pipe, passed: true };
     }
     return pipe;
   });
 
-  const birdRectangle = birdBox(bird);
   const collidedWithPipe = pipes.some((pipe) => {
     const [topBox, bottomBox] = pipeBoxes(pipe);
     return (

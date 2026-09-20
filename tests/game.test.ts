@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { CANVAS_HEIGHT, GROUND_HEIGHT } from '../src/constants';
+import { CANVAS_HEIGHT, GROUND_HEIGHT, PIPE_WIDTH } from '../src/constants';
 import { createGame, flapGame, updateGame } from '../src/game';
 
 describe('game', () => {
@@ -14,12 +14,24 @@ describe('game', () => {
     const game = flapGame(createGame(0));
     const withPipe = {
       ...game,
-      pipes: [{ x: 0, gapY: 150, passed: false }],
+      pipes: [{ x: -5, gapY: 150, passed: false }],
     };
     const updated = updateGame(withPipe, 0, () => 0);
 
     expect(updated.score).toBe(1);
     expect(updated.pipes[0].passed).toBe(true);
+  });
+
+  it('does not score a pipe while it still overlaps the bird', () => {
+    const game = flapGame(createGame(0));
+    const withPipe = {
+      ...game,
+      pipes: [{ x: 55 - PIPE_WIDTH, gapY: 0, passed: false }],
+    };
+    const updated = updateGame(withPipe, 1 / 60, () => 0.5);
+
+    expect(updated.state).toBe('gameover');
+    expect(updated.score).toBe(0);
   });
 
   it('ends on ground collision and updates the high score', () => {
