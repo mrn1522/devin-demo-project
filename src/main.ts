@@ -1,5 +1,10 @@
 import './style.css';
 
+import { flapGame, createGame, updateGame } from './game';
+import { onFlap } from './input';
+import { render } from './render';
+import { loadHighScore, saveHighScore } from './score';
+
 const canvas = document.querySelector<HTMLCanvasElement>('#game');
 
 if (!canvas) {
@@ -12,14 +17,33 @@ if (!context) {
   throw new Error('2D canvas context not available');
 }
 
-context.fillStyle = '#87ceeb';
-context.fillRect(0, 0, canvas.width, canvas.height);
-context.fillStyle = '#ffffff';
-context.font = '16px sans-serif';
-context.textAlign = 'center';
-context.textBaseline = 'middle';
-context.fillText(
-  'Flappy Bird — press Space',
-  canvas.width / 2,
-  canvas.height / 2,
-);
+const renderingContext: CanvasRenderingContext2D = context;
+
+const STEP = 1 / 60;
+let game = createGame(loadHighScore());
+let lastTime = performance.now();
+let accumulator = 0;
+
+onFlap(() => {
+  game = flapGame(game);
+});
+
+function frame(time: number): void {
+  const frameDelta = Math.min((time - lastTime) / 1000, 0.1);
+  lastTime = time;
+  accumulator += frameDelta;
+
+  while (accumulator >= STEP) {
+    const previousState = game.state;
+    game = updateGame(game, STEP, Math.random);
+    if (previousState !== 'gameover' && game.state === 'gameover') {
+      saveHighScore(game.highScore);
+    }
+    accumulator -= STEP;
+  }
+
+  render(renderingContext, game);
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
