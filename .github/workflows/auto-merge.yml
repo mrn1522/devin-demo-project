@@ -25,7 +25,9 @@ jobs:
   cleanup-branch:
     # GitHub's "Automatically delete head branches" does not reliably fire for
     # merges performed by the auto-merge executor, so delete explicitly.
-    if: github.event.pull_request.merged == true
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
