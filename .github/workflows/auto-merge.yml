@@ -2,7 +2,7 @@ name: Auto-merge Devin PRs
 
 on:
   pull_request:
-    types: [opened, ready_for_review, reopened, synchronize]
+    types: [opened, ready_for_review, reopened, synchronize, closed]
 
 permissions:
   contents: write
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   auto-merge:
-    if: github.event.pull_request.user.login == 'devin-ai-integration[bot]'
+    if: github.event.pull_request.user.login == 'devin-ai-integration[bot]' && github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - name: Enable auto-merge
@@ -20,4 +20,56 @@ jobs:
         # Arm auto-merge only — GitHub merges once every required check and
         # required review is satisfied. No direct-merge fallback: a privileged
         # merge here could bypass checks that are still pending.
-        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch
+        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash
+
+  cleanup-branch:
+    # GitHub's "Automatically delete head branches" does not reliably fire for
+    # merges performed by the auto-merge executor, so delete explicitly.
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete merged head branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          # Structured GraphQL variables: the branch name is never interpolated
+          # into an API path, so any valid git ref name is safe.
+          CURRENT_SHA=$(gh api graphql --jq '.data.repository.ref.target.oid // ""' \
+            -f o="$OWNER" -f n="$REPO" -f r="refs/heads/$HEAD_REF" -f query='
+              query($o: String!, $n: String!, $r: String!) {
+                repository(owner: $o, name: $n) { ref(qualifiedName: $r) { target { oid } } }
+              }')
+
+          # The repo's auto-delete setting may have already removed the branch.
+          if [ -z "$CURRENT_SHA" ]; then
+            echo "Branch $HEAD_REF already deleted."
+            exit 0
+          fi
+
+          # Only delete the exact ref instance that was merged: if the branch
+          # name was recreated with new commits, it is not ours to remove.
+          if [ "$CURRENT_SHA" != "$HEAD_SHA" ]; then
+            echo "Branch $HEAD_REF now points at $CURRENT_SHA (merged $HEAD_SHA); leaving it."
+            exit 0
+          fi
+
+          # Atomic compare-and-delete: the lease is rejected if the ref moved
+          # between our check and the delete, so a recreated branch survives.
+          if ! PUSH_OUT=$(git push origin --delete --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" "refs/heads/$HEAD_REF" 2>&1); then
+            if echo "$PUSH_OUT" | grep -qE "stale info|does not exist"; then
+              echo "Branch $HEAD_REF changed or was deleted concurrently; leaving it."
+              exit 0
+            fi
+            echo "$PUSH_OUT" >&2
+            exit 1
+          fi
+          echo "Deleted merged branch $HEAD_REF."
