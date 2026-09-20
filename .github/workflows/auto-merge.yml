@@ -118,6 +118,20 @@ jobs:
               --jq '.[].number' | wc -l)
           }
 
+          # Snapshots every PR (any state) attached to $BRANCH as head or base.
+          # Open-only queries cannot detect race casualties: deleting a head
+          # branch closes its PR, and deleting a base branch makes GitHub
+          # retarget dependents — both disappear from state=open results.
+          snapshot_prs() {
+            HEAD_PRS=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" --paginate \
+              -f state=all -f "head=$OWNER:$BRANCH" -f per_page=100 \
+              --jq '.[] | select(.head.repo.full_name == "'"$GITHUB_REPOSITORY"'") | .number' \
+              | sort -u)
+            BASE_PRS=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" --paginate \
+              -f state=all -f "base=$BRANCH" -f per_page=100 \
+              --jq '.[].number' | sort -u)
+          }
+
           while IFS= read -r BRANCH; do
             CURRENT_SHA=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
             if [ -z "$CURRENT_SHA" ]; then
@@ -158,6 +172,13 @@ jobs:
               continue
             fi
 
+            # Snapshot before the delete so PRs created inside the check-delete
+            # race stay detectable afterward. Any PR created between the
+            # snapshot and the delete is already closed or retargeted by the
+            # time we look again, so it must be diffed, not queried by state.
+            snapshot_prs
+            PREV_SET=$(printf '%s\n' $HEAD_PRS $BASE_PRS | sort -u)
+
             # Recheck immediately before deleting — a PR opened since the first
             # query does not move the ref, so the lease alone can't see it.
             live_prs
@@ -176,13 +197,16 @@ jobs:
             fi
             echo "Deleted $BRANCH (merged at $CURRENT_SHA)."
 
-            # Recovery: if a PR materialized inside the check-delete race
-            # window, recreate the ref via the API. The shallow checkout lacks
-            # CURRENT_SHA as a local object, so `git push SHA:` cannot work;
-            # POST /git/refs also fails atomically if the ref already exists.
+            # Repair race casualties: restore the ref via the API (the shallow
+            # checkout lacks CURRENT_SHA as a local object, so `git push SHA:`
+            # cannot work; POST /git/refs also fails atomically if the ref
+            # already exists), then reopen head-closed PRs and retarget
+            # base-deleted PRs back onto the restored branch.
             sleep 2
-            live_prs
-            if [ "$OPEN_COUNT" -gt 0 ] || [ "$DEPENDENT_COUNT" -gt 0 ]; then
+            snapshot_prs
+            NEW_SET=$(printf '%s\n' $HEAD_PRS $BASE_PRS | sort -u)
+            CASUALTIES=$(comm -13 <(printf '%s\n' "$PREV_SET") <(printf '%s\n' "$NEW_SET"))
+            if [ -n "$CASUALTIES" ]; then
               if ! RESTORE_OUT=$(gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
                   -f "ref=refs/heads/$BRANCH" -f "sha=$CURRENT_SHA" 2>&1); then
                 if echo "$RESTORE_OUT" | grep -q "already exists"; then
@@ -192,7 +216,25 @@ jobs:
                   exit 1
                 fi
               else
-                echo "Restored $BRANCH at $CURRENT_SHA — an open PR referenced it."
+                echo "Restored $BRANCH at $CURRENT_SHA — a new PR referenced it."
               fi
+              while IFS= read -r PR_NUM; do
+                if [ -z "$PR_NUM" ]; then
+                  continue
+                fi
+                PR_INFO=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" \
+                  --jq '[.state, .base.ref] | @tsv')
+                read -r PR_STATE PR_BASE <<< "$PR_INFO"
+                if [ "$PR_STATE" = "closed" ]; then
+                  gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" \
+                    -f state=open > /dev/null
+                  echo "Reopened PR #$PR_NUM (head branch restored)."
+                fi
+                if [ "$PR_BASE" != "$BRANCH" ]; then
+                  gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" \
+                    -f "base=$BRANCH" > /dev/null
+                  echo "Retargeted PR #$PR_NUM back onto $BRANCH."
+                fi
+              done <<< "$CASUALTIES"
             fi
           done <<< "$BRANCHES"
